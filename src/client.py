@@ -15,7 +15,7 @@ if __name__ == "__main__":
     
     while True:
         try:
-            command = input("\Digite um comando (ou 'sair'): ").strip()
+            command = input("Digite um comando (ou 'sair'): ").strip()
             if command.lower() == 'sair':
                 break
             if not command:
