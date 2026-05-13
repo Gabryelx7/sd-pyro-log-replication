@@ -20,7 +20,9 @@ class LogReplicator():
         self.voted_for = None
         
         self.log = []
-        self.commit_index = 0
+        self.commit_index = -1
+        self.next_index = {}
+        self.match_index = {}
 
         self.heartbeat_event = threading.Event()
         self.lock = threading.Lock()
@@ -76,6 +78,10 @@ class LogReplicator():
                     self.state = "leader"
                     print(f"*** LÍDER ELEITO para o termo {current_term} com {votes} votos ***")
 
+                    for peer in self.peers:
+                        self.next_index[peer] = len(self.log)
+                        self.match_index[peer] = -1
+
                     self.register_leader_ns()
                     threading.Thread(target=self.heartbeat_loop, daemon=True).start()
                 else:
@@ -89,39 +95,6 @@ class LogReplicator():
             print("Registro de líder realizado com sucesso no Name Server.")
         except Exception as e:
             print(f"Não foi possível conectar ao Name Server. Erro: {e}")
-
-    def heartbeat_loop(self):
-        while self.state == "leader":
-            with self.lock:
-                current_log = list(self.log)
-                current_commit = self.commit_index
-            
-            acks = 1
-
-            for peer_uri in self.peers:
-                try:
-                    peer = Pyro5.api.Proxy(peer_uri)
-                    success, follower_log_len = peer.append_entry(
-                        self.term,
-                        self.my_id,
-                        current_log,
-                        current_commit
-                    )
-
-                    if success and follower_log_len == len(current_log):
-                        acks += 1
-                except Exception:
-                    pass
-            
-            with self.commit_cond:
-                if self.state == "leader" and acks > len(REPLICAS) / 2:
-                    if len(current_log) > self.commit_index:
-                        self.commit_index = len(current_log)
-                        print(f"-> Líder atingiu maioria ({acks} acks)." \
-                              f"O novo índice de commit é {self.commit_index}")
-                        self.commit_cond.notify_all()
-                
-            time.sleep(0.5)
     
     def execute_command(self, command):
         if self.state != "leader":
@@ -130,40 +103,106 @@ class LogReplicator():
         with self.commit_cond:
             new_entry = {"term": self.term, "command": command}
             self.log.append(new_entry)
-            target_len = len(self.log)
+            target_idx = len(self.log) - 1
             print(f"-> Líder adicionou comando: '{command}'. Esperando resposta da maioria...")
 
-            while self.commit_index < target_len and self.state == "leader":
+            while self.commit_index < target_idx and self.state == "leader":
                 self.commit_cond.wait(timeout=0.5)
             
             if self.state != "leader":
                 print("Processo perdeu a liderança enquando esperava pelo consenso.")
                 return False
         
-        return True
+            return True
 
-    def append_entry(self, term, leader_id, entries, leader_commit):
+    def heartbeat_loop(self):
+        while self.state == "leader":
+            for peer_uri in self.peers:
+                with self.lock:
+                    next_idx = self.next_index[peer_uri]
+                    prev_log_idx = next_idx - 1
+                    prev_log_term = self.log[prev_log_idx]['term'] if prev_log_idx >= 0 else 0
+
+                    entry_to_send = self.log[next_idx] if next_idx < len(self.log) else None
+                    current_commit = self.commit_index
+                
+                try:
+                    peer = Pyro5.api.Proxy(peer_uri)
+                    success, follower_term = peer.append_entry(
+                        self.term,
+                        self.my_id,
+                        prev_log_idx,
+                        prev_log_term,
+                        entry_to_send,
+                        current_commit
+                    )
+
+                    with self.lock:
+                        if self.state != "leader":
+                            break
+                        
+                        if success:
+                            if entry_to_send:
+                                self.next_index[peer_uri] = next_idx + 1
+                                self.match_index[peer_uri] = next_idx
+                        else:
+                            if follower_term > self.term:
+                                self.state = "follower"
+                                self.term = follower_term
+                            else:
+                                self.next_index[peer_uri] = max(0, next_idx - 1)
+
+                except Exception:
+                    pass
+            
+            with self.commit_cond:
+                if self.state == "leader":
+                    match_indices = [len(self.log) - 1] + list(self.match_index.values())
+                    match_indices.sort(reverse=True)
+                    majority_index = match_indices[len(REPLICAS) // 2]
+
+                    if majority_index > self.commit_index and self.log[majority_index]['term'] == self.term:
+                        self.commit_index = majority_index
+                        print(f"-> Líder atingiu a maioria. Índice de commit atual: {self.commit_index}.")
+                        self.commit_cond.notify_all()
+                
+            time.sleep(0.5)
+
+    def append_entry(self, term, leader_id, prev_log_index, prev_log_term, entry, leader_commit):
         with self.lock:
             if term < self.term:
-                return False, len(self.log)
-            
-            if term >= self.term:
-                if self.state != "follower" or self.term != term:
-                    print(f"Reconhecendo novo líder {leader_id} para o termo {term}")
-                self.term = term
-                self.state = "follower"
-                self.voted_for = None
-                self.heartbeat_event.set()
+                return False, self.term
 
-                if len(entries) > len(self.log):
-                    self.log = entries
-                    print(f"    Entrada replicada. Log agora tem tamanho {len(self.log)}")
+            if self.state != "follower" or self.term != term:
+                print(f"Reconhecendo novo líder {leader_id} para o termo {term}")
+            self.term = term
+            self.state = "follower"
+            self.voted_for = None
+            self.heartbeat_event.set()
+
+            if prev_log_index >= len(self.log):
+                return False, self.term
+            
+            if prev_log_index >= 0 and self.log[prev_log_index]['term'] != prev_log_term:
+                return False, self.term
+            
+            if entry:
+                new_index = prev_log_index + 1
+
+                if new_index < len(self.log):
+                    if self.log[new_index]['term'] != entry['term']:
+                        print(f"    Conflito de log no índice {new_index}. Substituindo a entrada.")
+                        self.log = self.log[:new_index]
+                        self.log.append(entry)
+                    
+                else:
+                    self.log.append(entry)
+                    print(f"    Entrada adicionada no índice {new_index}. Tamanho do log: {len(self.log)}")
+
+            if leader_commit > self.commit_index:
+                self.commit_index = min(leader_commit, len(self.log) - 1)
                 
-                if leader_commit > self.commit_index:
-                    self.commit_index = min(leader_commit, len(self.log))
-                    print(f"-> Follower commitou até o índice {self.commit_index}")
-                
-            return True, len(self.log)
+            return True, self.term
         
     def request_vote(self, term, candidate_id):
         with self.lock:
