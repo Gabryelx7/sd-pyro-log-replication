@@ -121,6 +121,7 @@ class LogReplicator():
                     print(f"Reconhecendo novo líder {leader_id} para o termo {term}")
                 self.term = term
                 self.state = "follower"
+                self.voted_for = None
                 self.heartbeat_event.set()
             
             if len(entries) > len(self.log):
