@@ -65,10 +65,11 @@ class LogReplicator():
 
         for peer_uri in self.peers:
             try:
-                peer = Pyro5.api.Proxy(peer_uri)
-                got_vote = peer.request_vote(current_term, self.my_id)
-                if got_vote:
-                    votes += 1 
+                with Pyro5.api.Proxy(peer_uri) as peer:
+                    peer._pyroTimeout = 0.5
+                    got_vote = peer.request_vote(current_term, self.my_id)
+                    if got_vote:
+                        votes += 1 
             except Exception:
                 pass
         
@@ -127,30 +128,31 @@ class LogReplicator():
                     current_commit = self.commit_index
                 
                 try:
-                    peer = Pyro5.api.Proxy(peer_uri)
-                    success, follower_term = peer.append_entry(
-                        self.term,
-                        self.my_id,
-                        prev_log_idx,
-                        prev_log_term,
-                        entry_to_send,
-                        current_commit
-                    )
+                    with Pyro5.api.Proxy(peer_uri) as peer:
+                        peer._pyroTimeout = 0.5
+                        success, follower_term = peer.append_entry(
+                            self.term,
+                            self.my_id,
+                            prev_log_idx,
+                            prev_log_term,
+                            entry_to_send,
+                            current_commit
+                        )
 
-                    with self.lock:
-                        if self.state != "leader":
-                            break
-                        
-                        if success:
-                            if entry_to_send:
-                                self.next_index[peer_uri] = next_idx + 1
-                                self.match_index[peer_uri] = next_idx
-                        else:
-                            if follower_term > self.term:
-                                self.state = "follower"
-                                self.term = follower_term
+                        with self.lock:
+                            if self.state != "leader":
+                                break
+                            
+                            if success:
+                                if entry_to_send:
+                                    self.next_index[peer_uri] = next_idx + 1
+                                    self.match_index[peer_uri] = next_idx
                             else:
-                                self.next_index[peer_uri] = max(0, next_idx - 1)
+                                if follower_term > self.term:
+                                    self.state = "follower"
+                                    self.term = follower_term
+                                else:
+                                    self.next_index[peer_uri] = max(0, next_idx - 1)
 
                 except Exception:
                     pass
@@ -211,7 +213,7 @@ class LogReplicator():
                 self.state = "follower"
                 self.voted_for = None
             
-            if term == self.term and self.voted_for is None:
+            if term == self.term and (self.voted_for is None or self.voted_for == candidate_id):
                 self.voted_for = candidate_id
                 self.heartbeat_event.set()
                 print(f"Voto registrado em {candidate_id} para o termo {term}")
