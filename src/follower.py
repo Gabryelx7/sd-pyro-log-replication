@@ -20,9 +20,11 @@ class LogReplicator():
         self.voted_for = None
         
         self.log = []
+        self.commit_index = 0
 
         self.heartbeat_event = threading.Event()
         self.lock = threading.Lock()
+        self.commit_cond = threading.Condition(self.lock)
 
         self.peers = [
             f"PYRO:{data['id']}@localhost:{data['port']}"
@@ -90,31 +92,60 @@ class LogReplicator():
 
     def heartbeat_loop(self):
         while self.state == "leader":
-            current_log = list(self.log)
+            with self.lock:
+                current_log = list(self.log)
+                current_commit = self.commit_index
+            
+            acks = 1
 
             for peer_uri in self.peers:
                 try:
                     peer = Pyro5.api.Proxy(peer_uri)
-                    peer.append_entry(self.term, self.my_id, current_log)
+                    success, follower_log_len = peer.append_entry(
+                        self.term,
+                        self.my_id,
+                        current_log,
+                        current_commit
+                    )
+
+                    if success and follower_log_len == len(current_log):
+                        acks += 1
                 except Exception:
                     pass
-            time.sleep(1.0)
+            
+            with self.commit_cond:
+                if self.state == "leader" and acks > len(REPLICAS) / 2:
+                    if len(current_log) > self.commit_index:
+                        self.commit_index = len(current_log)
+                        print(f"-> Líder atingiu maioria ({acks} acks)." \
+                              f"O novo índice de commit é {self.commit_index}")
+                        self.commit_cond.notify_all()
+                
+            time.sleep(0.5)
     
     def execute_command(self, command):
         if self.state != "leader":
             return False
         
-        with self.lock:
+        with self.commit_cond:
             new_entry = {"term": self.term, "command": command}
             self.log.append(new_entry)
-            print(f"-> Líder adicionou comando: '{command}' no índice {len(self.log)-1}")
+            target_len = len(self.log)
+            print(f"-> Líder adicionou comando: '{command}'. Esperando resposta da maioria...")
+
+            while self.commit_index < target_len and self.state == "leader":
+                self.commit_cond.wait(timeout=0.5)
+            
+            if self.state != "leader":
+                print("Processo perdeu a liderança enquando esperava pelo consenso.")
+                return False
         
         return True
 
-    def append_entry(self, term, leader_id, entries):
+    def append_entry(self, term, leader_id, entries, leader_commit):
         with self.lock:
             if term < self.term:
-                return False
+                return False, len(self.log)
             
             if term >= self.term:
                 if self.state != "follower" or self.term != term:
@@ -123,14 +154,16 @@ class LogReplicator():
                 self.state = "follower"
                 self.voted_for = None
                 self.heartbeat_event.set()
-            
-            if len(entries) > len(self.log):
-                new_entries_count = len(entries) - len(self.log)
-                self.log = entries
-                print(f"{new_entries_count} entradas novas foram replicadas. Log agora tem tamanho {len(self.log)}")
-                print(f"    Última entrada no log: {self.log[-1]}")
+
+                if len(entries) > len(self.log):
+                    self.log = entries
+                    print(f"    Entrada replicada. Log agora tem tamanho {len(self.log)}")
                 
-            return True
+                if leader_commit > self.commit_index:
+                    self.commit_index = min(leader_commit, len(self.log))
+                    print(f"-> Follower commitou até o índice {self.commit_index}")
+                
+            return True, len(self.log)
         
     def request_vote(self, term, candidate_id):
         with self.lock:
