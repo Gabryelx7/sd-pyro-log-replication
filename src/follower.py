@@ -12,8 +12,9 @@ REPLICAS = {
 
 @Pyro5.api.expose
 class LogReplicator():
-    def __init__(self, my_id):
-        self.my_id = my_id
+    def __init__(self, my_config):
+        self.my_id = my_config["id"]
+        self.my_uri = f"PYRO:{self.my_id}@localhost:{my_config['port']}"
         self.state = "follower"
         self.term = 0
         self.voted_for = None
@@ -71,9 +72,19 @@ class LogReplicator():
                 if votes > len(REPLICAS) / 2:
                     self.state = "leader"
                     print(f"*** LÍDER ELEITO para o termo {current_term} com {votes} votos ***")
+
+                    self.register_leader_ns()
                 else:
                     self.state = "follower"
                     print(f"Eleição falhou com {votes} votos. Voltando ao estado de seguidor")
+    
+    def register_leader_ns(self):
+        try:
+            ns = Pyro5.api.locate_ns()
+            ns.register("Leader", self.my_uri)
+            print("Registro de líder realizado com sucesso no Name Server.")
+        except Exception as e:
+            print(f"Não foi possível conectar ao Name Server. Erro: {e}")
 
     
     def append_entry(self, term, leader_id, entry):
@@ -100,11 +111,11 @@ class LogReplicator():
             
             return False
 
-def start_daemon(port, object_id):
+def start_daemon(my_config):
     try:
-        daemon = Pyro5.api.Daemon(port=int(port))
-        replicator_instance = LogReplicator(object_id)
-        uri = daemon.register(replicator_instance, objectId=object_id)
+        daemon = Pyro5.api.Daemon(port=int(my_config["port"]))
+        replicator_instance = LogReplicator(my_config)
+        uri = daemon.register(replicator_instance, objectId=my_config["id"])
 
         print(f"Objeto Pronto. URI = {uri}")
         return daemon, replicator_instance
@@ -121,7 +132,7 @@ if __name__ == "__main__":
     my_config = REPLICAS[replica_id]
 
     print(f"Inicializando {my_config['id']} na porta {my_config['port']}...")
-    daemon, log_replicator = start_daemon(my_config["port"], my_config["id"])
+    daemon, log_replicator = start_daemon(my_config)
     if daemon and log_replicator:
         log_replicator.start_timeout_thread()
         try:
