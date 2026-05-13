@@ -44,7 +44,7 @@ class LogReplicator():
                 self.heartbeat_event.clear()
                 continue
 
-            if self.state != 'leader':
+            if self.state != "leader":
                 self.start_election()
 
     def start_election(self):
@@ -74,6 +74,7 @@ class LogReplicator():
                     print(f"*** LÍDER ELEITO para o termo {current_term} com {votes} votos ***")
 
                     self.register_leader_ns()
+                    threading.Thread(target=self.heartbeat_loop, daemon=True).start()
                 else:
                     self.state = "follower"
                     print(f"Eleição falhou com {votes} votos. Voltando ao estado de seguidor")
@@ -86,15 +87,29 @@ class LogReplicator():
         except Exception as e:
             print(f"Não foi possível conectar ao Name Server. Erro: {e}")
 
-    
+    def heartbeat_loop(self):
+        while self.state == "leader":
+            for peer_uri in self.peers:
+                try:
+                    peer = Pyro5.api.Proxy(peer_uri)
+                    peer.append_entry(self.term, self.my_id, [])
+                except Exception:
+                    pass
+            time.sleep(1.0)
+
     def append_entry(self, term, leader_id, entry):
         with self.lock:
+            if term < self.term:
+                return False
+            
             if term >= self.term:
+                if self.state != "follower" or self.term != term:
+                    print(f"Reconhecendo novo líder {leader_id} para o termo {term}")
                 self.term = term
                 self.state = "follower"
                 self.heartbeat_event.set()
-                return True
-            return False
+                
+            return True
         
     def request_vote(self, term, candidate_id):
         with self.lock:
