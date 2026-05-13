@@ -18,6 +18,8 @@ class LogReplicator():
         self.state = "follower"
         self.term = 0
         self.voted_for = None
+        
+        self.log = []
 
         self.heartbeat_event = threading.Event()
         self.lock = threading.Lock()
@@ -53,8 +55,7 @@ class LogReplicator():
             self.term += 1
             self.voted_for = self.my_id
             current_term = self.term
-            print(f"\n### Temporizador expirou. \
-                  Começando nova eleição para o termo {current_term}) ###")
+            print(f"\n### Temporizador expirou. Começando nova eleição para o termo {current_term}) ###")
 
         votes = 1
 
@@ -89,15 +90,28 @@ class LogReplicator():
 
     def heartbeat_loop(self):
         while self.state == "leader":
+            current_log = list(self.log)
+
             for peer_uri in self.peers:
                 try:
                     peer = Pyro5.api.Proxy(peer_uri)
-                    peer.append_entry(self.term, self.my_id, [])
+                    peer.append_entry(self.term, self.my_id, current_log)
                 except Exception:
                     pass
             time.sleep(1.0)
+    
+    def execute_command(self, command):
+        if self.state != "leader":
+            return False
+        
+        with self.lock:
+            new_entry = {"term": self.term, "command": command}
+            self.log.append(new_entry)
+            print(f"-> Líder adicionou comando: '{command}' no índice {len(self.log)-1}")
+        
+        return True
 
-    def append_entry(self, term, leader_id, entry):
+    def append_entry(self, term, leader_id, entries):
         with self.lock:
             if term < self.term:
                 return False
@@ -108,6 +122,12 @@ class LogReplicator():
                 self.term = term
                 self.state = "follower"
                 self.heartbeat_event.set()
+            
+            if len(entries) > len(self.log):
+                new_entries_count = len(entries) - len(self.log)
+                self.log = entries
+                print(f"{new_entries_count} entradas novas foram replicadas. Log agora tem tamanho {len(self.log)}")
+                print(f"    Última entrada no log: {self.log[-1]}")
                 
             return True
         
